@@ -1,5 +1,5 @@
 # CARS Project — Projectile Trajectory & Velocity Prediction
-## ML + Computer Vision  |  HEMRL, Pune  /  MNNIT Allahabad
+## ML + Computer Vision 
 
 ---
 
