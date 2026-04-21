@@ -8,11 +8,13 @@ Supports:
   - MOG2 background subtraction
   - Circularity filtering
   - Velocity-based outlier removal
+  - Kinematic RANSAC Parabola filtering
   - Annotated video output
 """
 
 import cv2
 import numpy as np
+import warnings
 from config import COLORS
 
 
@@ -165,13 +167,35 @@ def extract_trajectory(video_path, cfg,
     cap.release()
     if writer: writer.release()
 
-    rate = 100*len(times)/max(idx,1)
-    print(f"[detector] Done  →  {len(times)} positions  "
-          f"({rate:.1f}% detection rate)")
+    # Convert to numpy arrays
+    t_raw = np.array(times)
+    x_raw = np.array(xs)
+    y_raw = np.array(ys)
+    fids_raw = np.array(fids, dtype=int)
+
+    # ---> ACTUALLY CALL THE CLEAN FUNCTION HERE <---
+    if len(t_raw) > 4:
+        t_clean, x_clean, y_clean = clean(t_raw, x_raw, y_raw)
+        
+        # We also need to keep frame_indices aligned with the cleaned data
+        # by finding which timestamps survived the cleaning process.
+        valid_indices = np.isin(t_raw, t_clean)
+        fids_clean = fids_raw[valid_indices]
+    else:
+        t_clean, x_clean, y_clean, fids_clean = t_raw, x_raw, y_raw, fids_raw
+
+    rate = 100 * len(t_clean) / max(idx, 1)
+    print(f"[detector] Done  →  {len(t_clean)} clean positions kept from {len(t_raw)} raw "
+          f"({rate:.1f}% final valid rate)")
+
     return {
-        "times": np.array(times), "xs": np.array(xs), "ys": np.array(ys),
-        "fps": fps, "width": W, "height": H,
-        "frame_indices": np.array(fids, dtype=int),
+        "times": t_clean, 
+        "xs": x_clean, 
+        "ys": y_clean,
+        "fps": fps, 
+        "width": W, 
+        "height": H,
+        "frame_indices": fids_clean,
     }
 
 
@@ -196,25 +220,95 @@ def to_meters(xs, ys, height_px, scene_width_m, scale_override=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # Outlier removal
 # ─────────────────────────────────────────────────────────────────────────────
+from sklearn.neighbors import LocalOutlierFactor
+import warnings
+import numpy as np
 
-def clean(t, x, y, iqr_factor=2.5):
-    """IQR + velocity-based outlier filter."""
-    def iqr_ok(arr):
-        q1, q3 = np.percentile(arr, [10, 90])
-        d = iqr_factor * (q3 - q1)
-        return (arr >= q1 - d) & (arr <= q3 + d)
+def clean(t, x, y, ransac_iters=250, threshold_px=15.0, lof_neighbors=20):
+    """LOF + velocity filter + Strict Kinematic RANSAC for parabolic paths."""
+    
+    if len(t) < 4:
+        return t, x, y
 
-    mask = iqr_ok(x) & iqr_ok(y)
+    # 1. Local Outlier Factor (LOF) Spatial Filter
+    # Intelligently drops sparse, scattered jitters based on local point density
+    n_neighbors = min(lof_neighbors, len(t) - 1)
+    if n_neighbors >= 2:
+        X = np.column_stack((x, y))
+        # 'auto' contamination uses an offset of -1.5 (similar to Isolation Forest)
+        lof = LocalOutlierFactor(n_neighbors=n_neighbors, contamination='auto')
+        is_inlier = lof.fit_predict(X) == 1
+        t_f, x_f, y_f = t[is_inlier], x[is_inlier], y[is_inlier]
+    else:
+        t_f, x_f, y_f = t, x, y
 
-    if mask.sum() > 3:
-        xt, yt, tt = x[mask], y[mask], t[mask]
-        dt  = np.diff(tt) + 1e-9
-        spd = np.sqrt(np.diff(xt)**2 + np.diff(yt)**2) / dt
-        med = np.median(spd)
-        ok  = np.concatenate([[True], spd < med * 10])
-        idx = np.where(mask)[0][ok]
-        m2  = np.zeros(len(t), bool)
-        m2[idx] = True
-        mask = m2
+    if len(t_f) < 4:
+        return t_f, x_f, y_f
 
-    return t[mask], x[mask], y[mask]
+    # 2. Velocity Filter 
+    # Removes teleportation jitters along the path that LOF might consider dense
+    dt  = np.diff(t_f) + 1e-9
+    spd = np.sqrt(np.diff(x_f)**2 + np.diff(y_f)**2) / dt
+    med = np.median(spd)
+    ok  = np.concatenate([[True], spd < med * 10])
+    t_f, x_f, y_f = t_f[ok], x_f[ok], y_f[ok]
+
+    if len(t_f) < 4:
+        return t_f, x_f, y_f
+
+    # 3. Kinematic RANSAC Parabola Filter
+    # Enforces the physical shape of the trajectory
+    best_inliers = np.ones(len(t_f), dtype=bool)
+    best_inlier_count = 0
+    best_error = np.inf
+
+    span = max(np.ptp(x_f), np.ptp(y_f))
+    thresh = min(max(span * 0.05, 5.0), threshold_px) 
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore') 
+        for _ in range(ransac_iters):
+            idx = np.random.choice(len(t_f), 3, replace=False)
+            t_s, x_s, y_s = t_f[idx], x_f[idx], y_f[idx]
+
+            try:
+                p_x = np.polyfit(t_s, x_s, 2)
+                p_y = np.polyfit(t_s, y_s, 2)
+            except np.linalg.LinAlgError:
+                continue
+
+            x_pred = np.polyval(p_x, t_f)
+            y_pred = np.polyval(p_y, t_f)
+
+            dist = np.sqrt((x_f - x_pred)**2 + (y_f - y_pred)**2)
+            inliers = dist < thresh
+            count = np.sum(inliers)
+
+            if count > best_inlier_count:
+                best_inlier_count = count
+                best_inliers = inliers
+                best_error = np.mean(dist[inliers])
+            elif count == best_inlier_count:
+                err = np.mean(dist[inliers])
+                if err < best_error:
+                    best_inliers = inliers
+                    best_error = err
+
+    # 4. Final Refit & Strict Thresholding
+    if best_inlier_count >= 4:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            p_x = np.polyfit(t_f[best_inliers], x_f[best_inliers], 2)
+            p_y = np.polyfit(t_f[best_inliers], y_f[best_inliers], 2)
+
+        x_pred = np.polyval(p_x, t_f)
+        y_pred = np.polyval(p_y, t_f)
+        dist = np.sqrt((x_f - x_pred)**2 + (y_f - y_pred)**2)
+
+        median_err = np.median(dist[best_inliers])
+        strict_inliers = dist < max(median_err * 3.0, 5.0)
+
+        if np.sum(strict_inliers) >= 4:
+            return t_f[strict_inliers], x_f[strict_inliers], y_f[strict_inliers]
+
+    return t_f[best_inliers], x_f[best_inliers], y_f[best_inliers]

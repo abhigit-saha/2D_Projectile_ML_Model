@@ -59,9 +59,13 @@ class _PINNNet(nn.Module):
         layers += [nn.Linear(neurons, 2)]
         self.net = nn.Sequential(*layers)
 
-        # Learnable physics parameters (unconstrained; we use abs() where needed)
-        self.log_CD  = nn.Parameter(torch.tensor(0.0))   # log(CD)
-        self.log_om  = nn.Parameter(torch.tensor(3.4))   # log(omega) ≈ 30 rad/s
+        # Learnable physics parameters
+        # Paper uses CD ~ 0.45. log(0.45) ≈ -0.8
+        self.log_CD  = nn.Parameter(torch.tensor(-0.8))  
+        
+        # Unbounded omega around the Z axis (sticking out of 2D plane)
+        # Positive = Backspin (upward lift), Negative = Topspin (downward lift)
+        self.omega_z = nn.Parameter(torch.tensor(10.0))  
 
         # Xavier init
         for m in self.net.modules():
@@ -80,7 +84,8 @@ class ProjectilePINN:
     Learns NN weights + drag coefficient + spin (if applicable).
     """
 
-    def __init__(self, cfg, hidden=4, neurons=32,
+    # Aligned defaults to Chiha et al. (3 layers, 20 neurons)
+    def __init__(self, cfg, hidden=3, neurons=20,
                  beta=1e-3, n_coll=300, max_iter=3000, seed=42):
         self.cfg      = cfg
         self.hidden   = hidden
@@ -123,10 +128,9 @@ class ProjectilePINN:
         # --- Build model + optimiser ---
         net = _PINNNet(self.hidden, self.neurons)
         if not cfg["has_spin"]:
-            net.log_om.requires_grad_(False)
+            net.omega_z.requires_grad_(False)
 
         optimizer = torch.optim.Adam(net.parameters(), lr=5e-3)
-        # Cosine annealing scheduler
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=self.max_iter, eta_min=1e-5)
 
@@ -175,16 +179,23 @@ class ProjectilePINN:
 
             CD = torch.exp(net.log_CD)
 
-            # Projectile ODE residual:  a + drag + gravity = 0
-            fx = ax + K * V * CD * vx                     # x-residual
-            fy = ay + G + K * V * CD * vy                 # y-residual
+            # Projectile ODE residual: a_total = a_drag + a_lift + g 
+            # Re-arranged to f = 0
+            fx = ax + K * V * CD * vx                     
+            fy = ay + G + K * V * CD * vy                 
 
-            # Magnus / spin lift
+            # Magnus / spin lift (Corrected 2D cross-product derivation)
             if cfg["has_spin"]:
-                om = torch.exp(net.log_om)
-                CL = 1.0 / (2.0 + (R * om / V)**(-1) + 1e-9)
-                fx = fx - K * V * (CL / om) * (om * vy)
-                fy = fy + K * V * (CL / om) * (om * vx)
+                om_z = net.omega_z
+                om_mag = torch.abs(om_z)
+                
+                # CL_eff merges the Lift formula and the directional sign of the spin.
+                # This prevents zero-division gradients when spin passes through 0.
+                CL_eff = (R * om_z) / (2.0 * R * om_mag + V + 1e-9)
+                
+                # Lift in X opposes vy, Lift in Y follows vx
+                fx = fx + K * V * CL_eff * vy
+                fy = fy - K * V * CL_eff * vx
 
             loss_phys = (fx**2).mean() + (fy**2).mean()
 
@@ -199,8 +210,9 @@ class ProjectilePINN:
                 lv = float(loss.item())
                 hist.append(lv)
                 if verbose:
+                    om_print = float(net.omega_z.item()) if cfg["has_spin"] else 0.0
                     print(f"  [PINN] epoch {epoch:4d}  loss={lv:.3e}  "
-                          f"CD={float(CD.item()):.3f}")
+                          f"CD={float(CD.item()):.3f}  om_z={om_print:.1f}")
 
         self._net = net
         self.loss_history = hist
@@ -209,7 +221,8 @@ class ProjectilePINN:
         if verbose:
             kin = self.kinematics()
             print(f"[PINN] Done  loss={float(loss.item()):.3e}  "
-                  f"V0={kin['speed']:.2f}m/s  CD={kin['CD']:.3f}")
+                  f"V0={kin['speed']:.2f}m/s  CD={kin['CD']:.3f}  "
+                  f"spin={kin['spin_rps']:.2f}rps")
         return self
 
     def predict(self, t_query):
@@ -225,7 +238,7 @@ class ProjectilePINN:
     def kinematics(self):
         net = self._net
         CD  = float(torch.exp(net.log_CD).item())
-        om  = float(torch.exp(net.log_om).item()) if self.cfg["has_spin"] else 0.0
+        om  = float(net.omega_z.item()) if self.cfg["has_spin"] else 0.0
 
         with torch.enable_grad():
             # Two independent forward passes so each has its own graph
@@ -233,6 +246,7 @@ class ProjectilePINN:
             dvx = torch.autograd.grad(net(t0x)[0, 0], t0x)[0]
             t0y = torch.tensor([[0.0]], requires_grad=True)
             dvy = torch.autograd.grad(net(t0y)[0, 1], t0y)[0]
+            
         vx = float(dvx.item()) * self._xs / self._dt
         vy = float(dvy.item()) * self._ys / self._dt
         return {"CD": CD, "spin_rps": om / (2 * np.pi),
@@ -240,23 +254,15 @@ class ProjectilePINN:
                 "speed": float(np.sqrt(vx**2 + vy**2))}
 
     def classify(self):
+        # We can now confidently use the mathematically learned spin 
+        # to classify the shot, replacing the old 2nd derivative hack.
         kin = self.kinematics()
-        net = self._net
-        with torch.enable_grad():
-            tm  = torch.tensor([[0.5]], requires_grad=True)
-            out = net(tm)
-            yn_m = out[0, 1:2]
-            dvy  = torch.autograd.grad(yn_m, tm, create_graph=True)[0]
-            d2vy = torch.autograd.grad(dvy,  tm, create_graph=False)[0]
-        sign = -np.sign(float(d2vy.item()))
-        rps  = sign * kin["spin_rps"]
+        rps = kin["spin_rps"]
         return self.cfg["classify"](kin["speed"], rps), rps, kin["speed"]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 2. LSTM Predictor  (sequence → sequence, NumPy/SciPy only)
-#    Implemented as a vanilla RNN in NumPy since PyTorch is unavailable.
-#    Uses sliding window of past positions to predict next k positions.
 # ═════════════════════════════════════════════════════════════════════════════
 
 class LSTMPredictor:

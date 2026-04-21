@@ -1,39 +1,65 @@
 import cv2
-import numpy as np
-import os
+import sys
 
-width, height = 1280, 720
-fps = 30
-duration = 1.5
-num_frames = int(fps * duration)
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+VIDEO_PATH = "test_video3.mp4"  # Replace with your video file
+OUTPUT_MASK_PATH = "mog2_mask_output.jpg"
+OUTPUT_FRAME_PATH = "mog2_original_frame.jpg"
 
-# create test video
-output_path = 'test_video.mp4'
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+# The frame number to capture. Set this to a frame where the object 
+# is actively moving across the screen (e.g., frame 30 or 50).
+TARGET_FRAME = 30 
 
-x0, y0 = 100, 100
-v_x = (width - 200) / duration
-v_y = 900
-g = 1200
+def main():
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    if not cap.isOpened():
+        print(f"Error: Could not open video {VIDEO_PATH}")
+        sys.exit(1)
 
-# Moving background pattern or static
-bg = np.zeros((height, width, 3), dtype=np.uint8)
-# add some static noise or gradient to background for realism? Not strictly needed.
+    # Initialize MOG2 exactly as it is in your detector.py
+    bg_sub = cv2.createBackgroundSubtractorMOG2(
+        history=200, 
+        varThreshold=40, 
+        detectShadows=False
+    )
 
-for i in range(num_frames):
-    t = i / fps
-    x = int(x0 + v_x * t)
-    y = int(y0 + v_y * t - 0.5 * g * t**2)
+    frame_count = 0
+    saved = False
+
+    print(f"Processing video to frame {TARGET_FRAME} to build MOG2 history...")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Reached end of video before finding target frame.")
+            break
+
+        frame_count += 1
+
+        # Apply MOG2 to build the background model
+        # Learning rate is determined automatically by the history parameter
+        fg_mask = bg_sub.apply(frame)
+
+        # Apply the exact binary thresholding used in your pipeline
+        # This converts grayscale certainty into a strict black/white binary mask
+        _, binary_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+
+        # Once we hit the target frame, save the outputs and break
+        if frame_count == TARGET_FRAME:
+            cv2.imwrite(OUTPUT_MASK_PATH, binary_mask)
+            cv2.imwrite(OUTPUT_FRAME_PATH, frame) # Saving original for comparison
+            print(f"Success! Saved frame {TARGET_FRAME}.")
+            print(f"Mask saved to: {OUTPUT_MASK_PATH}")
+            print(f"Original frame saved to: {OUTPUT_FRAME_PATH}")
+            saved = True
+            break
+
+    cap.release()
     
-    y_draw = height - y
-    
-    frame = bg.copy()
-    
-    # Draw a yellow tennis ball (BGR = 0, 255, 255)
-    cv2.circle(frame, (x, y_draw), 20, (0, 255, 255), -1)
-    
-    out.write(frame)
+    if not saved:
+        print("Failed to save the target frame.")
 
-out.release()
-print(f"Generated {output_path}")
+if __name__ == "__main__":
+    main()
