@@ -15,6 +15,7 @@ Supports:
 import cv2
 import numpy as np
 import warnings
+import torch
 from config import COLORS
 
 
@@ -22,7 +23,7 @@ from config import COLORS
 # Single-frame detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
+def detect_frame(frame, color_ranges, min_r=3, max_r=80, bg_sub=None, last_pos=None):
     """
     Detect the most circular blob matching any of the given colours.
     Returns (cx, cy, radius) or None.
@@ -31,11 +32,9 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
 
     # Combine masks for all candidate colours
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    for ck in color_keys:
-        if ck in COLORS:
-            cr   = COLORS[ck]
-            m    = cv2.inRange(hsv, cr["lower"], cr["upper"])
-            mask = cv2.bitwise_or(mask, m)
+    for cr in color_ranges:
+        m = cv2.inRange(hsv, cr["lower"], cr["upper"])
+        mask = cv2.bitwise_or(mask, m)
 
     # Foreground gating
     if bg_sub is not None:
@@ -60,13 +59,23 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
         (cx, cy), r = cv2.minEnclosingCircle(cnt)
         if not (min_r <= r <= max_r):
             continue
+            
+        dist_score = 1.0
+        if last_pos is not None:
+            dist = np.hypot(cx - last_pos[0], cy - last_pos[1])
+            if dist > max(200, 5 * max_r):
+                continue
+            dist_score = 1.0 / (1.0 + dist / 150.0)
+
         perim = cv2.arcLength(cnt, True)
         circ  = (4 * np.pi * area) / (perim**2 + 1e-6)
-        if circ > best_score:
-            best_score = circ
+        
+        score = circ * dist_score
+        if score > best_score:
+            best_score = score
             best = (float(cx), float(cy), float(r))
 
-    return best if (best and best_score > 0.25) else None
+    return best if (best and best_score > 0.15) else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,7 +104,7 @@ def extract_trajectory(video_path, cfg,
     dict:
       times, xs, ys : detected positions (pixel)
       fps, width, height
-      frame_indices
+      frame_indices1
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -107,7 +116,53 @@ def extract_trajectory(video_path, cfg,
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if max_frames: total = min(total, max_frames)
 
-    colors  = color_override or cfg["colors"]
+    # --- ROI Selection ---
+    ret, initial_frame = cap.read()
+    color_ranges = []
+    last_known_pos = None
+    if ret:
+        print("\n--- INSTRUCTIONS ---")
+        print("1. A window will open with the first frame of your video.")
+        print("2. Click and drag a rectangle around the reference object you want to track.")
+        print("3. Press SPACE or ENTER to confirm.")
+        print("--------------------\n")
+        
+        display_img = initial_frame.copy()
+        scale = 1400.0 / float(max(W, 1))
+        
+        window_name = "Select Object to Track"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, int(W * scale), int(H * scale))
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
+        
+        roi = cv2.selectROI(window_name, cv2.resize(display_img, (int(W * scale), int(H * scale))), showCrosshair=True, fromCenter=False)
+        cv2.destroyAllWindows()
+        
+        if roi != (0, 0, 0, 0):
+            x, y, box_w, box_h = [int(v / scale) for v in roi]
+            cx, cy = x + box_w//2, y + box_h//2
+            inner_w, inner_h = max(1, box_w//2), max(1, box_h//2)
+            
+            roi_crop = initial_frame[max(0, cy - inner_h//2) : min(H, cy + inner_h//2), max(0, cx - inner_w//2) : min(W, cx + inner_w//2)]
+            if roi_crop.size > 0:
+                hsv_roi = cv2.cvtColor(roi_crop, cv2.COLOR_BGR2HSV)
+                h_med = np.median(hsv_roi[:,:,0])
+                s_med = np.median(hsv_roi[:,:,1])
+                v_med = np.median(hsv_roi[:,:,2])
+                
+                c_lower = np.array([max(0, int(h_med - 20)), max(0, int(s_med - 60)), max(0, int(v_med - 60))])
+                c_upper = np.array([min(179, int(h_med + 20)), min(255, int(s_med + 60)), min(255, int(v_med + 60))])
+                color_ranges = [{"lower": c_lower, "upper": c_upper}]
+                last_known_pos = (cx, cy)
+                print(f"[detector] Custom ROI Selected! Bounds: H:{int(h_med)}, S:{int(s_med)}, V:{int(v_med)}")
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    if not color_ranges:
+        colors  = color_override or cfg["colors"]
+        color_ranges = [COLORS[k] for k in colors if k in COLORS]
+        print(f"[detector] Default config colours: {colors}")
+
     min_r   = cfg.get("min_radius_px", 3)
     max_r   = cfg.get("max_radius_px", 80)
     bg_sub  = cv2.createBackgroundSubtractorMOG2(
@@ -119,23 +174,70 @@ def extract_trajectory(video_path, cfg,
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(annotate_output, fourcc, fps, (W, H))
 
-    times, xs, ys, fids = [], [], [], []
+    # Initialize MiDaS Depth Model
+    try:
+        midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+        transform = midas_transforms.small_transform
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        midas.eval().to(device)
+    except Exception as e:
+        print(f"[detector] Error loading MiDaS depth model: {e}")
+        midas = None
+        transform = None
+        device = None
+
+    times, xs, ys, zs, fids = [], [], [], [], []
     trail = []     # last N positions for trail drawing
     idx = 0
+    initial_depth_val = None
 
     print(f"[detector] {cfg['display_name']}  |  "
-          f"{W}x{H}@{fps:.0f}fps  |  colours: {colors}")
+          f"{W}x{H}@{fps:.0f}fps")
 
     while True:
         ret, frame = cap.read()
         if not ret or (max_frames and idx >= max_frames):
             break
 
-        det = detect_frame(frame, colors, min_r, max_r, bg_sub)
+        det = detect_frame(frame, color_ranges, min_r, max_r, bg_sub, last_known_pos)
         if det:
             cx, cy, r = det
+            last_known_pos = (cx, cy)
+
+            
+            # --- Depth computation ---
+            z_rel = 1.0
+            if midas is not None and transform is not None:
+                img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                input_batch = transform(img_rgb).to(device)
+                with torch.no_grad():
+                    prediction = midas(input_batch)
+                    prediction = torch.nn.functional.interpolate(
+                        prediction.unsqueeze(1),
+                        size=img_rgb.shape[:2],
+                        mode="bicubic",
+                        align_corners=False,
+                    ).squeeze()
+                depth_map = prediction.cpu().numpy()
+                
+                tx = max(0, int(cx - r))
+                ty = max(0, int(cy - r))
+                tw = min(W - tx, int(r * 2))
+                th = min(H - ty, int(r * 2))
+                
+                if tw > 0 and th > 0:
+                    obj_depth = depth_map[ty:ty+th, tx:tx+tw]
+                    current_inverse_depth = np.median(obj_depth)
+                    if initial_depth_val is None and current_inverse_depth > 0:
+                        initial_depth_val = current_inverse_depth
+                    
+                    if current_inverse_depth > 0 and initial_depth_val is not None:
+                        z_rel = initial_depth_val / current_inverse_depth
+
             times.append(idx / fps)
             xs.append(cx); ys.append(cy)
+            zs.append(z_rel)
             fids.append(idx)
             trail.append((int(cx), int(cy)))
             if len(trail) > 40: trail.pop(0)
@@ -149,7 +251,10 @@ def extract_trajectory(video_path, cfg,
                 # Detection circle
                 cv2.circle(frame, (int(cx), int(cy)), int(r), (0,255,0), 2)
                 cv2.circle(frame, (int(cx), int(cy)), 3,      (0,0,255), -1)
-                cv2.putText(frame, cfg["display_name"],
+                
+                # Annotate depth text
+                text = f"{z_rel:.2f}x dist"
+                cv2.putText(frame, text,
                             (int(cx)+8, int(cy)-8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
 
@@ -172,6 +277,7 @@ def extract_trajectory(video_path, cfg,
     x_raw = np.array(xs)
     y_raw = np.array(ys)
     fids_raw = np.array(fids, dtype=int)
+    z_raw = np.array(zs)
 
     # ---> ACTUALLY CALL THE CLEAN FUNCTION HERE <---
     if len(t_raw) > 4:
@@ -181,8 +287,9 @@ def extract_trajectory(video_path, cfg,
         # by finding which timestamps survived the cleaning process.
         valid_indices = np.isin(t_raw, t_clean)
         fids_clean = fids_raw[valid_indices]
+        z_clean = z_raw[valid_indices]
     else:
-        t_clean, x_clean, y_clean, fids_clean = t_raw, x_raw, y_raw, fids_raw
+        t_clean, x_clean, y_clean, fids_clean, z_clean = t_raw, x_raw, y_raw, fids_raw, z_raw
 
     rate = 100 * len(t_clean) / max(idx, 1)
     print(f"[detector] Done  →  {len(t_clean)} clean positions kept from {len(t_raw)} raw "
@@ -192,6 +299,7 @@ def extract_trajectory(video_path, cfg,
         "times": t_clean, 
         "xs": x_clean, 
         "ys": y_clean,
+        "zs": z_clean,
         "fps": fps, 
         "width": W, 
         "height": H,
