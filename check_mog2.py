@@ -42,10 +42,10 @@ def main():
             # 2. Replicate the exact thresholding and morphology from detector.py
             _, thresh = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
             
-            k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
-            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, k_open, iterations=1)
-            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k_close, iterations=2)
+            k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, k_open, iterations=3)
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k_close, iterations=3)
 
             # 3. Create side-by-side view (Original | MOG2 Mask | Cleaned Mask)
             # Convert masks to BGR so we can concatenate them with the original color frame

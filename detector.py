@@ -45,12 +45,12 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
         mask = cv2.bitwise_and(mask, fg)
 
     # 1. Aggressive Morphology
-    # A larger kernel for MORPH_OPEN will erase scattered 1-2 pixel noise.
+    # A smaller kernel for MORPH_OPEN will erase 1-2 pixel noise without erasing thin fast-moving objects.
     # A very large kernel for MORPH_CLOSE will fuse the ball into a solid mass.
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=2)
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=3)
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -60,9 +60,9 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
     for cnt in cnts:
         area = cv2.contourArea(cnt)
         
-        # 2. Strict Area Filtering
-        # A tiny ball is usually 5 to 50 pixels. A human body/arm is 500+ pixels.
-        if area < 1 or area > 300: 
+        # # 2. Strict Area Filtering
+        # # Safe minimum area, very large maximum area
+        if area < 10: 
             continue
             
         (cx, cy), r = cv2.minEnclosingCircle(cnt)
@@ -74,7 +74,7 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
             best_score = circ
             best = (float(cx), float(cy), float(r))
 
-    return best if (best and best_score > 0.6) else None
+    return best if (best and best_score > 0.01) else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -208,7 +208,9 @@ def to_meters(xs, ys, height_px, scene_width_m, scale_override=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def clean(t, x, y, iqr_factor=2.5):
-    """IQR + velocity-based outlier filter."""
+    """IQR + velocity-based outlier filter.
+    Returns t, x, y, mask (boolean array of kept points).
+    """
     def iqr_ok(arr):
         q1, q3 = np.percentile(arr, [10, 90])
         d = iqr_factor * (q3 - q1)
@@ -227,4 +229,4 @@ def clean(t, x, y, iqr_factor=2.5):
         m2[idx] = True
         mask = m2
 
-    return t[mask], x[mask], y[mask]
+    return t[mask], x[mask], y[mask], mask

@@ -26,12 +26,13 @@ import argparse, os, sys, warnings
 import numpy as np
 warnings.filterwarnings("ignore")
 
-from config     import OBJECTS, get_object, list_objects
+from config     import OBJECTS, get_object, list_objects, CAMERA_K
 from physics    import simulate, KalmanTracker
 from detector   import extract_trajectory, to_meters, clean
 from models     import ProjectilePINN, LSTMPredictor, predict_all
+from models_3d  import ProjectilePINN3D, AlgebraicProjectile3D, LinearProjectile3D
 from visualiser import (plot_comparison, plot_metrics, plot_velocity,
-                        make_full_report, annotate_video)
+                        make_full_report, annotate_video, plot_3d_trajectory)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,6 +56,12 @@ def parse_args():
                    help="Output folder  (default: results/)")
     p.add_argument("--simulate",    action="store_true",
                    help="Use synthetic simulation instead of real video")
+    p.add_argument("--use-3d",      action="store_true",
+                   help="Use 3D PINN for trajectory prediction (requires CAMERA_K)")
+    p.add_argument("--direction",   default=None, choices=["away", "towards"],
+                   help="Hint for 3D PINN: 'away' or 'towards' the camera to break depth ambiguity")
+    p.add_argument("--project-time", type=float, default=0.4,
+                   help="How many seconds into the future to project the 3D trajectory (default: 0.4s)")
     p.add_argument("--demo",        action="store_true",
                    help="Run all objects and produce comparison report")
     p.add_argument("--list",        action="store_true",
@@ -104,50 +111,51 @@ def load_video(cfg, args):
     if len(det["times"]) < 5:
         print("ERROR: <5 detections. Try --color or --no-bg-sub"); sys.exit(1)
 
-    # Interactive Scale Calibration
+    # Interactive Scale Calibration (Skip in 3D Mode)
+    scale_override = None
     import cv2
     import math
-    scale_override = None
-    cap = cv2.VideoCapture(args.video)
-    ret, frame = cap.read()
-    cap.release()
-    if ret:
-        pts = []
-        def on_click(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 2:
-                pts.append((x, y))
-                
-        cv2.namedWindow("Calibrate Scale")
-        cv2.setMouseCallback("Calibrate Scale", on_click)
-        print("\n[+] Click two points to define a known distance. Press 'q' to skip.")
-        
-        while len(pts) < 2:
-            disp = frame.copy()
-            cv2.putText(disp, "Click two points for scale calibration. 'q' to skip.", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            for p in pts:
-                cv2.circle(disp, p, 5, (0, 0, 255), -1)
-            cv2.imshow("Calibrate Scale", disp)
-            if cv2.waitKey(30) & 0xFF == ord('q'):
-                break
-                
-        if len(pts) == 2:
-            disp = frame.copy()
-            cv2.circle(disp, pts[0], 5, (0, 0, 255), -1)
-            cv2.circle(disp, pts[1], 5, (0, 0, 255), -1)
-            cv2.line(disp, pts[0], pts[1], (0, 255, 0), 2)
-            cv2.imshow("Calibrate Scale", disp)
-            cv2.waitKey(500)
+    if not args.use_3d:
+        cap = cv2.VideoCapture(args.video)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            pts = []
+            def on_click(event, x, y, flags, param):
+                if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 2:
+                    pts.append((x, y))
+                    
+            cv2.namedWindow("Calibrate Scale")
+            cv2.setMouseCallback("Calibrate Scale", on_click)
+            print("\n[+] Click two points to define a known distance. Press 'q' to skip.")
             
-            px_dist = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
-            try:
-                val = float(input(f"\nEnter real-world distance between points (pixels={px_dist:.1f}): "))
-                if val > 0:
-                    scale_override = px_dist / val
-                    print(f"[data] Scale set manually to {scale_override:.2f} px/m")
-            except ValueError:
-                pass
-        cv2.destroyWindow("Calibrate Scale")
+            while len(pts) < 2:
+                disp = frame.copy()
+                cv2.putText(disp, "Click two points for scale calibration. 'q' to skip.", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                for p in pts:
+                    cv2.circle(disp, p, 5, (0, 0, 255), -1)
+                cv2.imshow("Calibrate Scale", disp)
+                if cv2.waitKey(30) & 0xFF == ord('q'):
+                    break
+                    
+            if len(pts) == 2:
+                disp = frame.copy()
+                cv2.circle(disp, pts[0], 5, (0, 0, 255), -1)
+                cv2.circle(disp, pts[1], 5, (0, 0, 255), -1)
+                cv2.line(disp, pts[0], pts[1], (0, 255, 0), 2)
+                cv2.imshow("Calibrate Scale", disp)
+                cv2.waitKey(500)
+                
+                px_dist = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+                try:
+                    val = float(input(f"\nEnter real-world distance between points (pixels={px_dist:.1f}): "))
+                    if val > 0:
+                        scale_override = px_dist / val
+                        print(f"[data] Scale set manually to {scale_override:.2f} px/m")
+                except ValueError:
+                    pass
+            cv2.destroyWindow("Calibrate Scale")
 
     x_m, y_m = to_meters(det["xs"], det["ys"], det["height"],
                           cfg["scene_width_m"], scale_override=scale_override)
@@ -167,7 +175,11 @@ def load_video(cfg, args):
                 writer.writerow([f"{ti:.4f}", f"{xi:.4f}", f"{yi:.4f}"])
         print(f"[data] Raw trajectory (unfiltered) saved to: {csv_path}")
 
-    t, x, y  = clean(det["times"], x_m, y_m)
+    u_raw = det["xs"]
+    v_raw = det["ys"]
+    t, x_m, y_m, clean_mask = clean(det["times"], x_m, y_m)
+    u_clean = u_raw[clean_mask]
+    v_clean = v_raw[clean_mask]
 
     # Interactive Point Selection
     import numpy as np
@@ -178,7 +190,7 @@ def load_video(cfg, args):
     active = np.ones(len(t), dtype=bool)
     
     min_t, max_t = t.min(), t.max()
-    min_y, max_y = y.min(), y.max()
+    min_y, max_y = y_m.min(), y_m.max()
     span_t = max(max_t - min_t, 1e-3)
     span_y = max(max_y - min_y, 1e-3)
     
@@ -187,7 +199,7 @@ def load_video(cfg, args):
         py = int(H_plot - margin - (yi - min_y) / span_y * (H_plot - 2*margin))
         return px, py
         
-    pts_px = [to_px(t[i], y[i]) for i in range(len(t))]
+    pts_px = [to_px(t[i], y_m[i]) for i in range(len(t))]
     
     lasso_pts = []
     
@@ -267,12 +279,15 @@ def load_video(cfg, args):
     cv2.destroyWindow(win_name)
 
     t = t[active]
-    x = x[active]
-    y = y[active]
+    x_m = x_m[active]
+    y_m = y_m[active]
+    u_clean = u_clean[active]
+    v_clean = v_clean[active]
 
     print(f"[data] {len(t)} clean positions kept")
 
-    return t, x, y, {"det": det, "simulated": False}
+    meta = {"det": det, "simulated": False, "u": u_clean, "v": v_clean}
+    return t, x_m, y_m, meta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,7 +308,28 @@ def run(cfg, t_obs, x_obs, y_obs, meta, args, out_dir=None):
     print(f"  CARS PIPELINE  —  {cfg['display_name']}")
     print(f"{'='*60}")
 
-    # ── Train all models ──────────────────────────────────────────────────────
+    if args.use_3d and not meta.get("simulated"):
+        print(f"\n{'='*60}")
+        print(f"  3D PINN TRAJECTORY ESTIMATION")
+        print(f"{'='*60}")
+        
+        u_obs, v_obs = meta["u"], meta["v"]
+        
+        pinn_3d = LinearProjectile3D(K_matrix=CAMERA_K)
+        pinn_3d.fit(t_obs, u_obs, v_obs, direction=args.direction)
+        
+        # Predict future 3D points
+        t_query = np.linspace(t_obs.min(), t_obs.max() + args.project_time, 150)
+        X, Y, Z = pinn_3d.predict_3d(t_query)
+        
+        print(f"  [3D] Trajectory mapped. Landing prediction ready.")
+        
+        save_path = os.path.join(out, "3d_trajectory.html")
+        plot_3d_trajectory(X, Y, Z, save_path=save_path)
+        print(f"  Saved 3D plot to: {os.path.abspath(save_path)}")
+        return {"pinn_3d": pinn_3d, "X": X, "Y": Y, "Z": Z}
+
+    # ── Train all models (2D) ──────────────────────────────────────────────────
     results = predict_all(
         cfg, t_obs, x_obs, y_obs, t_gt, x_gt, y_gt,
         pinn_iters=args.pinn_iters,

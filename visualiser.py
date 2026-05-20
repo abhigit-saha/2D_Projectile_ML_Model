@@ -454,3 +454,66 @@ def annotate_video(input_path, output_path, cfg,
     cap.release()
     out.release()
     print(f"[video] Saved annotated video → {output_path}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3D Visualisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_3d_trajectory(X, Y, Z, save_path=None):
+    """Plot the predicted 3D trajectory using Plotly for interactive viewing."""
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print("Plotly not installed. Please install it using 'pip install plotly'")
+        return
+
+    # Note: OpenCV Y is down. For standard 3D plots, we usually want Z to be up.
+    # Let's map OpenCV (X, Y, Z) to Matplotlib/Plotly (X_plot, Y_plot, Z_plot)
+    # OpenCV: X=right, Y=down, Z=forward
+    # Plot: X=right, Y=forward, Z=up
+    X_plot = X
+    Y_plot = Z
+    Z_plot = -Y  # Invert Y so up is positive
+
+    fig = go.Figure()
+
+    # Plot the trajectory line
+    fig.add_trace(go.Scatter3d(
+        x=X_plot, y=Y_plot, z=Z_plot,
+        mode='lines',
+        name='PINN 3D Trajectory',
+        line=dict(color='blue', width=4)
+    ))
+    
+    # Ground plane (approximate, based on landing spot)
+    landing_idx = np.argmin(np.abs(Z_plot)) # Approximation
+    
+    # Scatter camera origin
+    fig.add_trace(go.Scatter3d(
+        x=[0], y=[0], z=[0],
+        mode='markers',
+        name='Camera Origin',
+        marker=dict(size=8, color='black', symbol='square')
+    ))
+    
+    # Scatter landing spot
+    fig.add_trace(go.Scatter3d(
+        x=[X_plot[-1]], y=[Y_plot[-1]], z=[Z_plot[-1]],
+        mode='markers',
+        name='Predicted Landing Spot',
+        marker=dict(size=8, color='red', symbol='x')
+    ))
+
+    fig.update_layout(
+        title='Predicted 3D Projectile Trajectory',
+        scene=dict(
+            xaxis_title='X (Right) [m]',
+            yaxis_title='Z (Depth) [m]',
+            zaxis_title='-Y (Height) [m]',
+            aspectmode='data'  # This keeps the 1:1:1 scale ratio so the arc looks physically accurate!
+        ),
+        margin=dict(l=0, r=0, b=0, t=40)
+    )
+    
+    if save_path:
+        fig.write_html(save_path)

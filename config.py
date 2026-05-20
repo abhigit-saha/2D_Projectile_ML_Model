@@ -105,7 +105,7 @@ OBJECTS = {
         "drag_coeff":   0.55,
         "has_spin":     True,
         "colors":       ["yellow", "green"],
-        "min_radius_px": 1, "max_radius_px": 40,
+        "min_radius_px": 1, "max_radius_px": 200,
         "scene_width_m": 23.77,
         "classify":     _cls_tennis,
         "presets": {
@@ -224,7 +224,7 @@ OBJECTS = {
         "drag_coeff":   0.47,
         "has_spin":     False,
         "colors":       ["white", "orange", "yellow"],
-        "min_radius_px": 3, "max_radius_px": 80,
+        "min_radius_px": 3, "max_radius_px": 200,
         "scene_width_m": 30.0,
         "classify":     _cls_generic,
         "presets": {
@@ -255,3 +255,11 @@ def list_objects():
               f"radius: {v['radius_m']*100:.1f} cm  |  "
               f"Cd: {v['drag_coeff']}")
     print()
+
+# Camera Intrinsic Matrix (calibrated)
+import numpy as np
+CAMERA_K = np.array([
+    [1500.0, 0.0, 960.0],
+    [0.0, 1500.0, 540.0],
+    [0.0, 0.0, 1.0]
+])
